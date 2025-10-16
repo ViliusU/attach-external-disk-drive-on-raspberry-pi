@@ -36,7 +36,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Resolve owner UID/GID
+# Resolve owner UID/GID (use the invoking user if run with sudo)
 if ! id "$OWNER_USER" >/dev/null 2>&1; then
   echo "Owner user '$OWNER_USER' does not exist." >&2
   exit 1
@@ -44,13 +44,11 @@ fi
 OWNER_UID="$(id -u "$OWNER_USER")"
 OWNER_GID="$(id -g "$OWNER_USER")"
 
-echo "[1/7] Ensuring ntfs-3g is installed..."
-if ! dpkg -s ntfs-3g >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y ntfs-3g
-fi
+echo "[1/6] Installing ntfs-3g (if needed)..."
+apt-get update -y
+apt-get install -y ntfs-3g
 
-echo "[2/7] Detecting NTFS partition..."
+echo "[2/6] Detecting NTFS partition..."
 if [[ -z "$UUID" ]]; then
   if [[ -n "$DEVICE" ]]; then
     if [[ ! -b "$DEVICE" ]]; then
@@ -67,10 +65,10 @@ if [[ -z "$UUID" ]]; then
       exit 1
     fi
   else
-    # Auto-pick the largest NTFS/NTFS3 partition
+    # Auto-pick the largest NTFS partition
     read -r DEVICE UUID < <(
       lsblk -b -rno NAME,FSTYPE,UUID,SIZE,TYPE \
-      | awk '$2 ~ /^(ntfs|ntfs3)$/ && $5=="part"{print $1, $3, $4}' \
+      | awk '$2 ~ /^ntfs|ntfs3$/ && $5=="part"{print $1, $3, $4}' \
       | sort -k3,3nr \
       | awk 'NR==1{print "/dev/"$1, $2}'
     )
@@ -80,8 +78,11 @@ if [[ -z "$UUID" ]]; then
     fi
   fi
 else
-  # UUID provided; resolve device (optional)
+  # UUID provided; find its device (optional)
   DEVICE="$(blkid -U "$UUID" 2>/dev/null || true)"
+  if [[ -z "$DEVICE" ]]; then
+    echo "Note: could not resolve device for UUID=$UUID (that’s OK)."
+  fi
 fi
 
 echo "Selected partition:"
@@ -90,13 +91,13 @@ echo "  UUID   : $UUID"
 echo "  MOUNT  : $MOUNTPOINT"
 echo "  OWNER  : $OWNER_USER (uid=$OWNER_UID gid=$OWNER_GID)"
 
-echo "[3/7] Creating mount point..."
+echo "[3/6] Creating mount point..."
 mkdir -p "$MOUNTPOINT"
 
-echo "[4/7] Backing up and updating /etc/fstab..."
+echo "[4/6] Backing up and updating /etc/fstab..."
 cp -an /etc/fstab "/etc/fstab.backup.$(date +%Y%m%d-%H%M%S)"
 
-# Remove any existing entries for this UUID or mountpoint (idempotent)
+# Remove any existing lines for this UUID or this mountpoint to keep it idempotent
 tmpfile="$(mktemp)"
 awk -v mp="$MOUNTPOINT" -v id="UUID=$UUID" '
   BEGIN{OFS="\t"}
@@ -107,35 +108,19 @@ awk -v mp="$MOUNTPOINT" -v id="UUID=$UUID" '
 cat "$tmpfile" > /etc/fstab
 rm -f "$tmpfile"
 
-# Preferred NTFS options for Pi + Docker
-OPTS="defaults,nofail,uid=$OWNER_UID,gid=$OWNER_GID,umask=022,windows_names,big_writes"
-# Optional (uncomment for on-demand mounting):
-# OPTS="$OPTS,x-systemd.automount,x-systemd.idle-timeout=60"
+# Append our entry
+echo -e "UUID=$UUID\t$MOUNTPOINT\tntfs-3g\tdefaults,nofail,uid=$OWNER_UID,gid=$OWNER_GID,umask=022\t0\t0" >> /etc/fstab
 
-echo -e "UUID=$UUID\t$MOUNTPOINT\tntfs-3g\t$OPTS\t0\t0" >> /etc/fstab
-
-echo "[5/7] Unmounting any existing mounts of this UUID (if present)..."
-# Unmount anywhere it might already be mounted
-if command -v findmnt >/dev/null 2>&1; then
-  while read -r t; do
-    [[ -n "$t" ]] && umount -f "$t" || true
-  done < <(findmnt -no TARGET UUID="$UUID" || true)
-fi
-# Also unmount target mountpoint if mounted
+echo "[5/6] Mounting..."
+# If mounted elsewhere, try to unmount first (best effort)
 mountpoint -q "$MOUNTPOINT" && umount -f "$MOUNTPOINT" || true
-
-echo "[6/7] Mounting..."
 mount -a
 
-echo "[7/7] Verifying..."
+echo "[6/6] Verifying..."
 if mountpoint -q "$MOUNTPOINT"; then
   df -h | awk 'NR==1 || $6=="'"$MOUNTPOINT"'"'
-  opts="$(findmnt -no OPTIONS "$MOUNTPOINT" || true)"
-  echo "Mount options: $opts"
-  if ! grep -q "uid=$OWNER_UID" <<<"$opts"; then
-    echo "WARNING: uid mapping not applied (actual: $opts). Are you using ntfs3 kernel driver instead of ntfs-3g?" >&2
-  fi
-  echo "Success: $MOUNTPOINT is mounted with uid=$OWNER_UID gid=$OWNER_GID."
+  echo "Success: $MOUNTPOINT is mounted with ownership uid=$OWNER_UID gid=$OWNER_GID."
+  echo "Tip: try 'ls -la $MOUNTPOINT' to see your files."
 else
   echo "Failed to mount at $MOUNTPOINT. Check 'dmesg | tail -n 50' for details." >&2
   exit 1
